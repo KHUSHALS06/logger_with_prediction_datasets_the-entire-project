@@ -1,0 +1,1524 @@
+import tkinter as tk
+from tkinter import messagebox
+import threading
+import queue
+import socket
+import json
+import csv
+import os
+import time
+import logging
+from datetime import datetime
+from pathlib import Path
+from collections import defaultdict
+
+
+CONFIG_FILE     = "config.json"
+DATA_DIR        = Path("data")
+LOG_DIR         = Path("logs")
+DATASETS_DIR    = Path("datasets")
+BATCH_SIZE      = 500
+BATCH_INTERVAL  = 2.0
+QUEUE_MAXSIZE   = 20_000
+RECONNECT_DELAY = 5.0
+
+SBS_FIELDS = [
+    "message_type", "transmission_type", "session_id", "aircraft_id",
+    "icao", "flight_id",
+    "date_generated", "time_generated", "date_logged", "time_logged",
+    "callsign", "altitude", "ground_speed", "track",
+    "latitude", "longitude", "vertical_rate", "squawk",
+    "alert", "emergency", "spi", "on_ground",
+]
+
+EXTRA_FIELDS = [
+    "ship_name",
+    "country",
+    "branch",
+    "operator",
+    "manufacturer",
+    "typecode",
+    "model",
+    "registration",
+    "military",
+    "confidence",
+    "logged_at",
+]
+CSV_HEADER         = SBS_FIELDS + EXTRA_FIELDS
+MILITARY_TRACK_HDR = CSV_HEADER
+
+LOG_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(exist_ok=True)
+DATASETS_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  [%(levelname)-8s]  %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_DIR / "adsb_logger.log"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("adsb")
+
+
+def load_config() -> dict:
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_config(data: dict):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+class MilitaryPredictor:
+    _BUILTIN_CALLSIGNS = [
+        ("RCH",        "USA",        "USAF AMC",              "Transport (C-17/C-5/KC-10)"),
+        ("REACH",      "USA",        "USAF AMC",              "Transport"),
+        ("SAM",        "USA",        "USAF",                  "Special Air Mission"),
+        ("SPAR",       "USA",        "USAF",                  "Special Priority"),
+        ("SHELL",      "USA",        "USAF",                  "Tanker"),
+        ("JAKE",       "USA",        "USAF",                  "Tanker"),
+        ("TOPCAT",     "USA",        "USAF",                  "Fighter"),
+        ("EVAC",       "USA",        "USAF AMC",              "Aeromedical"),
+        ("STEEL",      "USA",        "USAF",                  "Bomber/Strike"),
+        ("COBRA",      "USA",        "US Military",           "Fighter"),
+        ("HERKY",      "USA",        "USAF",                  "C-130 Hercules"),
+        ("GOLFER",     "USA",        "USAF",                  "ISR"),
+        ("FORTE",      "USA",        "USAF",                  "B-52"),
+        ("DEATH",      "USA",        "USAF",                  "B-2 Spirit"),
+        ("GHOST",      "USA",        "USAF",                  "B-2 Spirit"),
+        ("DARKSTAR",   "USA",        "USAF",                  "ISR"),
+        ("SIGINT",     "USA",        "US Military",           "SIGINT"),
+        ("IRON",       "USA",        "US Navy",               "Fighter"),
+        ("CONVOY",     "USA",        "US Navy",               "Maritime Patrol"),
+        ("RANGER",     "USA",        "US Navy",               "P-8 Poseidon"),
+        ("ASCOT",      "UK",         "RAF",                   "Transport (C-17/A400M)"),
+        ("RAFAIR",     "UK",         "RAF",                   "Transport"),
+        ("TARTAN",     "UK",         "RAF",                   "Tanker/ISR"),
+        ("VORTEX",     "UK",         "RAF",                   "Tanker"),
+        ("CANFORCE",   "Canada",     "RCAF",                  "Transport (CC-130/CC-150)"),
+        ("COTAM",      "France",     "French Air Force",      "Transport"),
+        ("FROG",       "France",     "French Air Force",      "Fighter"),
+        ("FAF",        "France",     "French Air Force",      "Any"),
+        ("GAF",        "Germany",    "German Air Force",      "Any"),
+        ("GERMAN AF",  "Germany",    "German Air Force",      "Transport"),
+        ("IAM",        "Italy",      "Italian Air Force",     "Transport"),
+        ("AMIGO",      "Spain",      "Spanish Air Force",     "Any"),
+        ("DUTCHAF",    "Netherlands","Royal Netherlands AF",  "Any"),
+        ("Belgian",    "Belgium",    "Belgian Air Force",     "Any"),
+        ("NORWEGIAN AIR FORCE", "Norway", "Royal Norwegian AF", "Any"),
+        ("DANISH AIR FORCE",    "Denmark","Royal Danish AF",  "Any"),
+        ("AUSSIE",     "Australia",  "RAAF",                  "Any"),
+        ("DRAGON",     "Australia",  "RAAF",                  "Any"),
+        ("INDIAN AIR FORCE",    "India",  "IAF",              "Transport"),
+        ("IAF",        "India",      "IAF",                   "Any"),
+        ("PAK AIR FORCE",       "Pakistan","PAF",             "Transport"),
+        ("PAKAF",      "Pakistan",   "PAF",                   "Any"),
+        ("BANGLA AIR FORCE",    "Bangladesh","BAF",           "Transport"),
+        ("SLAF",       "Sri Lanka",  "SLAF",                  "Any"),
+        ("MAJAN",      "Oman",       "RAFO",                  "Transport"),
+        ("SULTAN",     "Oman",       "RAFO",                  "VIP Transport"),
+        ("OMAN AIR FORCE",      "Oman","RAFO",                "Any"),
+        ("QATARI",     "Qatar",      "QEAF",                  "Transport (C-17)"),
+        ("KAFR",       "Kuwait",     "KFAF",                  "Transport"),
+        ("UAEAF",      "UAE",        "UAEAF",                 "Any"),
+        ("SAUDAF",     "Saudi Arabia","RSAF",                 "Any"),
+        ("BAHRAIN",    "Bahrain",    "RBAF",                  "Any"),
+        ("HAF",        "Israel",     "IAF",                   "Any"),
+        ("ISRAF",      "Israel",     "IAF",                   "Any"),
+        ("TURKISH AIR FORCE",   "Turkey","TurAF",             "Any"),
+        ("TURAF",      "Turkey",     "TurAF",                 "Any"),
+        ("TUDM",       "Malaysia",   "RMAF",                  "Any"),
+        ("RSAF",       "Singapore",  "RSAF",                  "Any"),
+        ("JASDF",      "Japan",      "JASDF",                 "Any"),
+        ("JMSDF",      "Japan",      "JMSDF",                 "Maritime Patrol"),
+        ("ROKAF",      "South Korea","ROKAF",                 "Any"),
+        ("PLAAF",      "China",      "PLAAF",                 "Any"),
+        ("RFF",        "Russia",     "Russian Air Force",     "Any"),
+    ]
+
+    _ALTITUDE_PROFILES = [
+        (0,      500,   "Helicopter / Low-level tactical",   10),
+        (501,    2000,  "Helicopter / Gunship",               8),
+        (2001,   10000, "Maritime Patrol / Coastal ISR",      8),
+        (10001,  20000, "Tactical transport / ISR",           5),
+        (20001,  30000, "C-130 / Tactical transport",         5),
+        (43001,  51000, "High-performance military",         25),
+        (51001,  65000, "ISR platform (U-2 / Global Hawk)",  40),
+        (65001,  99999, "Classified / U-2 extreme altitude", 50),
+    ]
+
+    _BUILTIN_HEX_RANGES = [
+        (0xAE0000, 0xAFFFFF, "USA",        "military"),
+        (0x43C000, 0x43CFFF, "UK",         "military"),
+        (0x7C0000, 0x7FFFFF, "Australia",  "government"),
+        (0x800000, 0x87FFFF, "India",      "government"),
+        (0xC80000, 0xC8FFFF, "Canada",     "government"),
+        (0x738000, 0x73FFFF, "Germany",    "government"),
+        (0x3C0000, 0x3FFFFF, "Germany",    "government"),
+        (0x4B0000, 0x4BFFFF, "Netherlands","government"),
+        (0x460000, 0x467FFF, "Norway",     "government"),
+        (0x458000, 0x45FFFF, "Sweden",     "government"),
+        (0x456000, 0x457FFF, "Denmark",    "government"),
+        (0x4D0000, 0x4DFFFF, "Belgium",    "government"),
+        (0x500000, 0x53FFFF, "Italy",      "government"),
+        (0x340000, 0x37FFFF, "France",     "government"),
+        (0x380000, 0x3BFFFF, "Spain",      "government"),
+        (0x896000, 0x897FFF, "Japan",      "government"),
+        (0x71C000, 0x71FFFF, "South Korea","government"),
+        (0x760000, 0x76FFFF, "China",      "government"),
+        (0x140000, 0x17FFFF, "Russia",     "government"),
+    ]
+
+    def __init__(self):
+        self.prediction_cache: dict[str, dict]        = {}
+        self.verification_status: dict[str, str]      = {}
+        self.predicted_military_rows: dict[str, list] = defaultdict(list)
+
+        self.verified_locals:   dict[str, dict] = {}
+        self.mil_icao_dict:     dict[str, dict] = {}
+        self.callsign_patterns: list[dict]      = []
+        self.hex_ranges:        list[tuple]     = []
+
+        self._load_datasets()
+
+    def _load_datasets(self):
+        self._load_verified_locals()
+        self._load_mil_icao_db()
+        self._load_callsign_patterns()
+        self._load_hex_ranges()
+        log.info(
+            f"Predictor ready  "
+            f"verified={len(self.verified_locals)}  "
+            f"mil_db={len(self.mil_icao_dict)}  "
+            f"callsigns={len(self.callsign_patterns)}  "
+            f"hex_ranges={len(self.hex_ranges)}"
+        )
+
+    def _load_verified_locals(self):
+        path = DATASETS_DIR / "military_dataset.csv"
+        if not path.exists():
+            return
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                icao = row.get("icao", "").strip().upper()
+                if icao:
+                    self.verified_locals[icao] = {
+                        "country":      row.get("country", ""),
+                        "branch":       row.get("branch", "Military"),
+                        "operator":     row.get("operator", ""),
+                        "manufacturer": row.get("manufacturer", ""),
+                        "typecode":     row.get("typecode", ""),
+                        "model":        row.get("model", ""),
+                        "registration": row.get("registration", ""),
+                    }
+
+    def _load_mil_icao_db(self):
+        path = DATASETS_DIR / "mil_icao_db.csv"
+        if not path.exists():
+            log.warning("mil_icao_db.csv not found — Layer 3 disabled")
+            return
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                icao = row.get("icao", "").strip().upper()
+                if icao:
+                    self.mil_icao_dict[icao] = {
+                        "country":      row.get("country", ""),
+                        "branch":       row.get("branch", "Military"),
+                        "operator":     row.get("operator", ""),
+                        "manufacturer": row.get("manufacturer", ""),
+                        "typecode":     row.get("typecode", ""),
+                        "model":        row.get("model", ""),
+                        "registration": row.get("registration", ""),
+                    }
+
+    def _load_callsign_patterns(self):
+        for prefix, country, branch, aircraft_type in self._BUILTIN_CALLSIGNS:
+            self.callsign_patterns.append({
+                "prefix":        prefix.upper(),
+                "country":       country,
+                "branch":        branch,
+                "aircraft_type": aircraft_type,
+            })
+        path = DATASETS_DIR / "callsign_patterns.csv"
+        if not path.exists():
+            return
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                prefix = row.get("pattern", "").strip().upper()
+                if prefix:
+                    self.callsign_patterns.append({
+                        "prefix":        prefix,
+                        "country":       row.get("country", ""),
+                        "branch":        row.get("branch", ""),
+                        "aircraft_type": row.get("aircraft_type", ""),
+                    })
+        self.callsign_patterns.sort(key=lambda x: len(x["prefix"]), reverse=True)
+
+    def _load_hex_ranges(self):
+        for start, end, country, block_type in self._BUILTIN_HEX_RANGES:
+            self.hex_ranges.append((start, end, country, block_type))
+        path = DATASETS_DIR / "icao_hex_ranges.csv"
+        if not path.exists():
+            return
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                try:
+                    start      = int(row["range_start"], 16)
+                    end        = int(row["range_end"],   16)
+                    country    = row.get("country", "")
+                    block_type = row.get("block_type", "civilian")
+                    self.hex_ranges.append((start, end, country, block_type))
+                except (KeyError, ValueError):
+                    continue
+
+    def _apply_altitude_boost(self, confidence: int, military: str,
+                              altitude_str: str, model: str) -> tuple[int, str, str]:
+        if not altitude_str:
+            return confidence, military, model
+        try:
+            alt_ft = int(altitude_str.strip())
+            for alt_min, alt_max, alt_hint, boost in self._ALTITUDE_PROFILES:
+                if alt_min <= alt_ft <= alt_max:
+                    confidence = min(confidence + boost, 99)
+                    if not model and confidence < 95:
+                        model = alt_hint
+                    break
+            if military == "POSSIBLE" and confidence >= 85:
+                military = "YES"
+        except ValueError:
+            pass
+        return confidence, military, model
+
+    def predict(self, merged: dict) -> dict:
+        icao     = merged.get("icao", "").strip().upper()
+        callsign = merged.get("callsign", "").strip().upper()
+        altitude = merged.get("altitude", "").strip()
+
+        country      = ""
+        branch       = ""
+        operator     = ""
+        manufacturer = ""
+        typecode     = ""
+        model        = ""
+        registration = ""
+        military     = "NO"
+        confidence   = 0
+
+        if icao and icao in self.prediction_cache:
+            cached = dict(self.prediction_cache[icao])
+            if (
+                cached.get("military") == "POSSIBLE"
+                and not cached.get("_altitude_boosted")
+                and altitude
+            ):
+                conf_now = int(cached.get("confidence", 0))
+                mil_now  = cached.get("military", "POSSIBLE")
+                mdl_now  = cached.get("model", "")
+                conf_now, mil_now, mdl_now = self._apply_altitude_boost(
+                    conf_now, mil_now, altitude, mdl_now
+                )
+                cached["confidence"]       = str(conf_now)
+                cached["military"]         = mil_now
+                cached["model"]            = mdl_now
+                cached["_altitude_boosted"] = True
+                self.prediction_cache[icao] = cached
+                log.debug(f"Cache altitude re-eval  icao={icao}  conf={conf_now}  mil={mil_now}")
+
+            public = {k: v for k, v in cached.items() if not k.startswith("_")}
+            merged.update(public)
+
+            if cached.get("military") in ("YES", "POSSIBLE"):
+                self.predicted_military_rows[icao].append(dict(merged))
+            return merged
+
+        if icao and icao in self.verified_locals:
+            v            = self.verified_locals[icao]
+            country      = v["country"]
+            branch       = v.get("branch", "Military")
+            operator     = v.get("operator", "")
+            manufacturer = v.get("manufacturer", "")
+            typecode     = v.get("typecode", "")
+            model        = v.get("model", "")
+            registration = v.get("registration", "")
+            military     = "YES"
+            confidence   = 100
+
+        elif icao and icao in self.mil_icao_dict:
+            v            = self.mil_icao_dict[icao]
+            country      = v["country"]
+            branch       = v.get("branch", "Military")
+            operator     = v.get("operator", "")
+            manufacturer = v.get("manufacturer", "")
+            typecode     = v.get("typecode", "")
+            model        = v.get("model", "")
+            registration = v.get("registration", "")
+            military     = "YES"
+            confidence   = 100
+
+        else:
+            if callsign:
+                for pattern in self.callsign_patterns:
+                    if callsign.startswith(pattern["prefix"]):
+                        country    = pattern["country"]
+                        branch     = pattern["branch"]
+                        operator   = pattern["branch"]
+                        model      = pattern.get("aircraft_type", "")
+                        military   = "YES"
+                        confidence = 95
+                        break
+
+            if icao:
+                try:
+                    icao_int = int(icao, 16)
+                    for start, end, rng_country, block_type in self.hex_ranges:
+                        if start <= icao_int <= end:
+                            if not country:
+                                country = rng_country
+                            if block_type == "military" and confidence < 70:
+                                military   = "POSSIBLE"
+                                confidence = 70
+                                branch     = branch or "Military"
+                                operator   = operator or f"{rng_country} Military"
+                            elif block_type == "government" and confidence < 50:
+                                military   = "POSSIBLE"
+                                confidence = 50
+                                branch     = branch or "Military"
+                                operator   = operator or f"{rng_country} Government"
+                            break
+                except ValueError:
+                    pass
+
+            altitude_boosted = False
+            if confidence > 0 and altitude:
+                confidence, military, model = self._apply_altitude_boost(
+                    confidence, military, altitude, model
+                )
+                altitude_boosted = True
+
+        result = {
+            "country":           country,
+            "branch":            branch or ("Military" if military != "NO" else ""),
+            "operator":          operator,
+            "manufacturer":      manufacturer,
+            "typecode":          typecode,
+            "model":             model,
+            "registration":      registration,
+            "military":          military,
+            "confidence":        str(confidence),
+            "_altitude_boosted": altitude_boosted if military != "NO" else True,
+        }
+
+        if icao:
+            self.prediction_cache[icao] = result
+
+        public = {k: v for k, v in result.items() if not k.startswith("_")}
+        merged.update(public)
+
+        if military in ("YES", "POSSIBLE") and icao:
+            self.predicted_military_rows[icao].append(dict(merged))
+
+        return merged
+
+    def set_verification(self, icao: str, status: str,
+                         country: str = "", branch: str = "",
+                         operator: str = "", model: str = "",
+                         full_corrections: dict | None = None):
+        icao = icao.upper()
+        self.verification_status[icao] = status
+
+        if status == "modified":
+            corrections = full_corrections or {
+                "country": country, "branch": branch,
+                "operator": operator, "model": model,
+            }
+            if icao in self.prediction_cache:
+                self.prediction_cache[icao].update(corrections)
+            for row in self.predicted_military_rows.get(icao, []):
+                row.update(corrections)
+
+        elif status == "rejected":
+            if icao in self.prediction_cache:
+                self.prediction_cache[icao]["military"] = "NO"
+            self.predicted_military_rows.pop(icao, None)
+
+    def write_military_tracks(self, path: Path):
+        rows_written = 0
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=MILITARY_TRACK_HDR, extrasaction="ignore")
+            for icao, rows in self.predicted_military_rows.items():
+                status = self.verification_status.get(icao, "pending")
+                if status == "rejected":
+                    continue
+                writer.writerows(rows)
+                rows_written += len(rows)
+        log.info(f"Military tracks written  rows={rows_written}  path={path}")
+
+    def update_training_dataset(self):
+        path = DATASETS_DIR / "military_dataset.csv"
+        existing = set()
+        if path.exists():
+            with open(path, newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    existing.add(row.get("icao", "").upper())
+
+        fields   = ["icao", "country", "branch", "operator",
+                    "manufacturer", "typecode", "model", "registration"]
+        new_rows = []
+        for icao, status in self.verification_status.items():
+            if status not in ("validated", "modified"):
+                continue
+            if icao in existing:
+                continue
+            cached = self.prediction_cache.get(icao, {})
+            new_rows.append({
+                "icao":         icao,
+                "country":      cached.get("country", ""),
+                "branch":       cached.get("branch", "Military"),
+                "operator":     cached.get("operator", ""),
+                "manufacturer": cached.get("manufacturer", ""),
+                "typecode":     cached.get("typecode", ""),
+                "model":        cached.get("model", ""),
+                "registration": cached.get("registration", ""),
+            })
+
+        if new_rows:
+            write_header = not path.exists()
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+                if write_header:
+                    writer.writeheader()
+                writer.writerows(new_rows)
+            log.info(f"Training dataset updated  new_entries={len(new_rows)}")
+
+    def clear_session(self):
+        self.prediction_cache.clear()
+        self.verification_status.clear()
+        self.predicted_military_rows.clear()
+        log.info("Predictor session memory cleared")
+
+
+_EDIT_GROUPS = [
+    ("SBS DATA",         None,                  "header"),
+    ("icao",             "ICAO Hex",            "sbs"),
+    ("callsign",         "Callsign",            "sbs"),
+    ("altitude",         "Altitude (ft)",       "sbs"),
+    ("ground_speed",     "Ground Speed (kts)",  "sbs"),
+    ("track",            "Track (°)",           "sbs"),
+    ("latitude",         "Latitude",            "sbs"),
+    ("longitude",        "Longitude",           "sbs"),
+    ("vertical_rate",    "Vertical Rate",       "sbs"),
+    ("squawk",           "Squawk",              "sbs"),
+    ("alert",            "Alert",               "sbs"),
+    ("emergency",        "Emergency",           "sbs"),
+    ("spi",              "SPI",                 "sbs"),
+    ("on_ground",        "On Ground",           "sbs"),
+    ("transmission_type","Transmission Type",   "sbs"),
+    ("session_id",       "Session ID",          "sbs"),
+    ("aircraft_id",      "Aircraft ID",         "sbs"),
+    ("flight_id",        "Flight ID",           "sbs"),
+    ("date_generated",   "Date Generated",      "sbs"),
+    ("time_generated",   "Time Generated",      "sbs"),
+    ("date_logged",      "Date Logged",         "sbs"),
+    ("time_logged",      "Time Logged",         "sbs"),
+    ("ENRICHED DATA",    None,                  "header"),
+    ("country",          "Country",             "extra"),
+    ("branch",           "Branch",              "extra"),
+    ("operator",         "Operator",            "extra"),
+    ("manufacturer",     "Manufacturer",        "extra"),
+    ("typecode",         "Type Code",           "extra"),
+    ("model",            "Aircraft Model",      "extra"),
+    ("registration",     "Registration",        "extra"),
+    ("military",         "Military",            "extra"),
+    ("confidence",       "Confidence",          "extra"),
+    ("ship_name",        "Ship Name",           "extra"),
+    ("logged_at",        "Logged At",           "extra"),
+]
+
+
+class MilContactRow(tk.Frame):
+    STATUS_COLORS = {
+        "pending":   "#E0A030",
+        "validated": "#2EC27E",
+        "modified":  "#7EC8E3",
+        "rejected":  "#C0392B",
+    }
+
+    def __init__(self, parent, predictor: MilitaryPredictor, row: dict, on_resize):
+        super().__init__(parent, bg=C["surface"],
+                         highlightthickness=1,
+                         highlightbackground=C["border"])
+        self.predictor = predictor
+        self.data      = dict(row)
+        self.icao      = row.get("icao", "").upper()
+        self.on_resize = on_resize
+        self._status   = "pending"
+        self._expanded = False
+        self._entries: dict[str, tk.Entry] = {}
+
+        self._build_summary()
+        self._build_edit_panel()
+
+    def _build_summary(self):
+        conf    = int(self.data.get("confidence", 0))
+        bar_col = C["red"] if conf >= 95 else C["amber"]
+
+        tk.Frame(self, width=6, bg=bar_col).pack(side="left", fill="y")
+
+        body = tk.Frame(self, bg=C["surface"])
+        body.pack(side="left", fill="both", expand=True, padx=12, pady=10)
+
+        def lbl(parent, text, fg, bold=True):
+            return tk.Label(parent, text=text, bg=C["surface"], fg=fg,
+                            font=(C["mono"], 11, "bold" if bold else ""),
+                            anchor="w")
+
+        top = tk.Frame(body, bg=C["surface"])
+        top.pack(fill="x")
+        lbl(top, self.icao, C["text_accent"]).pack(side="left")
+        lbl(top, f"  {self.data.get('callsign','').strip():<10}", C["text"]).pack(side="left")
+        lbl(top, self.data.get("model","") or self.data.get("typecode","") or "—",
+            C["text"]).pack(side="left", padx=(8, 0))
+        lbl(top, f" {conf}%", bar_col).pack(side="right")
+
+        mid = tk.Frame(body, bg=C["surface"])
+        mid.pack(fill="x", pady=(4, 0))
+        parts = [
+            self.data.get("country","") or "—",
+            self.data.get("branch","")  or "—",
+            self.data.get("operator","")or "—",
+        ]
+        if self.data.get("registration"): parts.append(self.data["registration"])
+        if self.data.get("altitude"):     parts.append(f"{self.data['altitude']} ft")
+
+        has_pos = bool(self.data.get("latitude") and self.data.get("longitude"))
+        parts.append("📍 POS" if has_pos else "⚠ NO POS")
+
+        lbl(mid, "  ·  ".join(parts), C["text_dim"], bold=False).pack(side="left")
+
+        btn_f = tk.Frame(body, bg=C["surface"])
+        btn_f.pack(fill="x", pady=(10, 0))
+
+        self._status_lbl = tk.Label(btn_f, text="● PENDING",
+                                    bg=C["surface"], fg=C["amber"],
+                                    font=(C["mono"], 10, "bold"))
+        self._status_lbl.pack(side="left")
+
+        def abtn(text, cmd, bg, fg):
+            return tk.Button(btn_f, text=text, command=cmd,
+                             bg=bg, fg=fg,
+                             font=(C["mono"], 10, "bold"),
+                             relief="flat", cursor="hand2",
+                             padx=14, pady=5)
+
+        self._btn_reject   = abtn("✕ REJECT",   self._on_reject,    C["border"],    C["text_dim"])
+        self._btn_modify   = abtn("✎ MODIFY",   self._toggle_edit,  C["border_hi"], C["text"])
+        self._btn_validate = abtn("✓ VALIDATE", self._on_validate,  C["green"],     C["bg"])
+
+        self._btn_reject.pack(side="right", padx=(4, 0))
+        self._btn_modify.pack(side="right",  padx=(4, 0))
+        self._btn_validate.pack(side="right", padx=(4, 0))
+
+    def _build_edit_panel(self):
+        self._edit_frame = tk.Frame(self, bg=C["bg"],
+                                    highlightthickness=1,
+                                    highlightbackground=C["border_hi"])
+
+        canvas = tk.Canvas(self._edit_frame, bg=C["bg"],
+                           highlightthickness=0, height=420)
+        vsb = tk.Scrollbar(self._edit_frame, orient="vertical",
+                           command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=C["bg"])
+        win   = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _resize_inner(event):
+            canvas.itemconfig(win, width=event.width)
+        canvas.bind("<Configure>", _resize_inner)
+
+        def _scroll(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        canvas.bind("<MouseWheel>", _scroll)
+
+        def section_hdr(parent, text):
+            f = tk.Frame(parent, bg=C["border"])
+            f.pack(fill="x", pady=(12, 4))
+            tk.Label(f, text=f"  {text}",
+                     bg=C["border"], fg=C["text_dim"],
+                     font=(C["mono"], 10, "bold"),
+                     anchor="w").pack(fill="x", ipady=5)
+
+        def make_field(parent, key, label):
+            row_f = tk.Frame(parent, bg=C["bg"])
+            row_f.pack(fill="x", padx=14, pady=3)
+            tk.Label(row_f, text=f"{label:<22}",
+                     bg=C["bg"], fg=C["text_dim"],
+                     font=(C["mono"], 10, "bold"),
+                     anchor="w", width=22).pack(side="left")
+            e = tk.Entry(row_f, font=(C["mono"], 11),
+                         bg=C["surface"], fg=C["text"],
+                         insertbackground=C["text_accent"],
+                         relief="flat", highlightthickness=1,
+                         highlightbackground=C["border_hi"])
+            e.insert(0, self.data.get(key, "") or "")
+            e.pack(side="left", fill="x", expand=True, ipady=5, padx=(8, 14))
+            self._entries[key] = e
+
+        for item in _EDIT_GROUPS:
+            key, label, kind = item
+            if kind == "header":
+                section_hdr(inner, key)
+            else:
+                make_field(inner, key, label)
+
+        def _update_scroll(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        inner.bind("<Configure>", _update_scroll)
+
+        btn_bar = tk.Frame(self._edit_frame, bg=C["bg"])
+        btn_bar.pack(fill="x", padx=14, pady=12)
+
+        tk.Button(btn_bar, text="SAVE CHANGES",
+                  command=self._on_modified,
+                  bg=C["amber"], fg=C["bg"],
+                  font=(C["mono"], 11, "bold"),
+                  relief="flat", cursor="hand2",
+                  padx=18, pady=7).pack(side="left")
+
+        tk.Button(btn_bar, text="CANCEL",
+                  command=self._toggle_edit,
+                  bg=C["border"], fg=C["text_dim"],
+                  font=(C["mono"], 11, "bold"),
+                  relief="flat", cursor="hand2",
+                  padx=18, pady=7).pack(side="left", padx=(12, 0))
+
+    def _toggle_edit(self):
+        if self._expanded:
+            self._edit_frame.pack_forget()
+            self._expanded = False
+        else:
+            self._edit_frame.pack(fill="x", padx=4, pady=(0, 4))
+            self._expanded = True
+        self.on_resize()
+
+    def _set_status(self, status: str, label: str):
+        self._status = status
+        color = self.STATUS_COLORS.get(status, C["text_dim"])
+        self._status_lbl.config(text=f"● {label}", fg=color)
+        for b in (self._btn_validate, self._btn_modify, self._btn_reject):
+            b.config(state="disabled", bg=C["border"], fg=C["text_dim"])
+        if self._expanded:
+            self._toggle_edit()
+
+    def _on_validate(self):
+        self.predictor.set_verification(self.icao, "validated")
+        self._set_status("validated", "VALIDATED")
+
+    def _on_modified(self):
+        corrections = {key: e.get().strip() for key, e in self._entries.items()}
+        self.predictor.set_verification(
+            self.icao, "modified",
+            corrections.get("country",""),
+            corrections.get("branch",""),
+            corrections.get("operator",""),
+            corrections.get("model",""),
+            corrections,
+        )
+        self._set_status("modified", "MODIFIED")
+
+    def _on_reject(self):
+        self.predictor.set_verification(self.icao, "rejected")
+        self._set_status("rejected", "REJECTED")
+        for w in self.winfo_children():
+            try: w.config(bg=C["bg"])
+            except Exception: pass
+
+
+def parse_sbs_line(line: str, ship_name: str) -> dict | None:
+    try:
+        parts = line.strip().split(",")
+        if not parts or parts[0] != "MSG":
+            return None
+        while len(parts) < 22:
+            parts.append("")
+        row = {field: parts[i].strip() for i, field in enumerate(SBS_FIELDS)}
+        row["ship_name"] = ship_name
+        row["logged_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        return row
+    except Exception:
+        return None
+
+
+class AircraftCache:
+    def __init__(self):
+        self._state: dict[str, dict] = defaultdict(dict)
+
+    def update_and_get(self, row: dict) -> dict:
+        icao = row.get("icao", "")
+        if not icao:
+            return row
+        cached = self._state[icao]
+        merged = dict(cached)
+        for k, v in row.items():
+            if v not in ("", None):
+                merged[k] = v
+        for meta in ("message_type", "transmission_type", "session_id",
+                     "aircraft_id", "flight_id", "date_generated",
+                     "time_generated", "date_logged", "time_logged",
+                     "ship_name", "logged_at"):
+            merged[meta] = row.get(meta, "")
+        self._state[icao] = merged
+        return merged
+
+    def get_latest(self, icao: str) -> dict:
+        return dict(self._state.get(icao.upper(), {}))
+
+
+class TCPListener(threading.Thread):
+    def __init__(self, host, port, ship_name, data_queue, stop_event,
+                 on_stats, predictor: MilitaryPredictor, on_military_detected):
+        super().__init__(daemon=True, name="TCPListener")
+        self.host                 = host
+        self.port                 = port
+        self.ship_name            = ship_name
+        self.data_queue           = data_queue
+        self.stop_event           = stop_event
+        self.on_stats             = on_stats
+        self.predictor            = predictor
+        self.on_military_detected = on_military_detected
+        self.cache                = AircraftCache()
+        self._popup_shown: set[str] = set()
+        self._pending_popups: dict[str, threading.Timer] = {}
+
+    def run(self):
+        buf = ""
+        while not self.stop_event.is_set():
+            try:
+                log.info(f"Connecting  {self.host}:{self.port}")
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(10.0)
+                    s.connect((self.host, self.port))
+                    s.settimeout(2.0)
+                    log.info("TCP connected")
+                    while not self.stop_event.is_set():
+                        try:
+                            chunk = s.recv(4096).decode("utf-8", errors="ignore")
+                            if not chunk:
+                                break
+                            buf += chunk
+                            lines = buf.split("\n")
+                            buf = lines[-1]
+                            for line in lines[:-1]:
+                                self._process_line(line)
+                        except socket.timeout:
+                            continue
+                        except Exception as exc:
+                            log.error(f"Recv error: {exc}")
+                            break
+            except Exception as exc:
+                if not self.stop_event.is_set():
+                    log.error(f"TCP error: {exc}  — retry in {RECONNECT_DELAY}s")
+                    time.sleep(RECONNECT_DELAY)
+
+    def _process_line(self, line: str):
+        row = parse_sbs_line(line, self.ship_name)
+        if not row:
+            return
+        merged = self.cache.update_and_get(row)
+        merged = self.predictor.predict(merged)
+        icao = merged.get("icao", "").upper()
+
+        if (
+            merged.get("military") in ("YES", "POSSIBLE")
+            and icao
+            and icao not in self._popup_shown
+            and icao not in self.predictor.verification_status
+        ):
+            self._popup_shown.add(icao)
+            if icao in self._pending_popups:
+                self._pending_popups[icao].cancel()
+
+            def _fire_popup(i=icao):
+                if self.stop_event.is_set():
+                    return
+                latest = self.cache.get_latest(i)
+                cached_pred = {
+                    k: v for k, v in self.predictor.prediction_cache.get(i, {}).items()
+                    if not k.startswith("_")
+                }
+                latest.update(cached_pred)
+                latest["icao"] = i
+                self.on_military_detected(latest)
+                self._pending_popups.pop(i, None)
+
+            timer = threading.Timer(3.0, _fire_popup)
+            timer.daemon = True
+            timer.start()
+            self._pending_popups[icao] = timer
+
+        try:
+            self.data_queue.put_nowait(merged)
+            self.on_stats("rx")
+        except queue.Full:
+            log.warning("Queue full — row dropped")
+
+
+class BatchWriter(threading.Thread):
+    def __init__(self, data_queue, stop_event, csv_path, on_stats):
+        super().__init__(daemon=True, name="BatchWriter")
+        self.data_queue   = data_queue
+        self.stop_event   = stop_event
+        self.csv_path     = csv_path
+        self.on_stats     = on_stats
+        self.rows_written = 0
+
+    def _flush(self, writer, file_obj, batch):
+        writer.writerows(batch)
+        file_obj.flush()
+        self.rows_written += len(batch)
+        self.on_stats("write", len(batch))
+
+    def run(self):
+        with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
+            writer     = csv.DictWriter(f, fieldnames=CSV_HEADER, extrasaction="ignore")
+            last_flush = time.monotonic()
+            while not self.stop_event.is_set() or not self.data_queue.empty():
+                batch = []
+                try:
+                    while len(batch) < BATCH_SIZE:
+                        batch.append(self.data_queue.get_nowait())
+                except queue.Empty:
+                    pass
+                now = time.monotonic()
+                if batch and (len(batch) >= BATCH_SIZE or now - last_flush >= BATCH_INTERVAL):
+                    self._flush(writer, f, batch)
+                    last_flush = now
+                elif not batch:
+                    time.sleep(0.1)
+            tail = []
+            while not self.data_queue.empty():
+                try:
+                    tail.append(self.data_queue.get_nowait())
+                except queue.Empty:
+                    break
+            if tail:
+                self._flush(writer, f, tail)
+        log.info(f"Writer closed  total_rows={self.rows_written:,}")
+
+
+class Session:
+    def __init__(self, ship_name: str):
+        self.ship_name  = ship_name
+        self.start_ts   = datetime.now()
+        self.stop_ts    = None
+        ts              = self.start_ts.strftime('%Y%m%d_%H%M%S')
+
+        self._running     = DATA_DIR / f"{ship_name}_{ts}_RUNNING.csv"
+        self._final       = None
+        self._mil_running = DATA_DIR / f"MILITARY_{ship_name}_{ts}_RUNNING.csv"
+        self._mil_final   = None
+
+    def init_csv(self):
+        with open(self._running, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=CSV_HEADER).writeheader()
+        log.info(f"Session started  {self._running.name}")
+        with open(self._mil_running, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=MILITARY_TRACK_HDR).writeheader()
+        log.info(f"Military file started  {self._mil_running.name}")
+
+    def finalize(self) -> Path:
+        self.stop_ts = datetime.now()
+        ts_range = (
+            f"_{self.start_ts.strftime('%Y%m%d_%H%M%S')}"
+            f"_TO_{self.stop_ts.strftime('%Y%m%d_%H%M%S')}.csv"
+        )
+        self._final = DATA_DIR / f"{self.ship_name}{ts_range}"
+        if self._running.exists():
+            self._running.rename(self._final)
+        log.info(f"Session saved  {self._final.name}")
+
+        self._mil_final = DATA_DIR / f"MILITARY_{self.ship_name}{ts_range}"
+        if self._mil_running.exists():
+            self._mil_running.rename(self._mil_final)
+        log.info(f"Military tracks saved  {self._mil_final.name}")
+
+        return self._final
+
+    def mark_incomplete(self):
+        if self._running.exists():
+            inc = Path(str(self._running).replace("_RUNNING.csv", "_INCOMPLETE.csv"))
+            self._running.rename(inc)
+            log.warning(f"Session incomplete  {inc.name}")
+        if self._mil_running.exists():
+            mil_inc = Path(str(self._mil_running).replace("_RUNNING.csv", "_INCOMPLETE.csv"))
+            self._mil_running.rename(mil_inc)
+            log.warning(f"Military incomplete  {mil_inc.name}")
+
+    @property
+    def csv_path(self) -> Path:
+        return self._running
+
+    @property
+    def mil_csv_path(self) -> Path:
+        return self._mil_running
+
+    @property
+    def final_path(self) -> Path | None:
+        return self._final
+
+    @property
+    def mil_final_path(self) -> Path | None:
+        return self._mil_final
+
+
+def export_to_excel(csv_path: Path) -> Path:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.cell import WriteOnlyCell
+    except ImportError:
+        raise RuntimeError("openpyxl not installed.  Run:  pip install openpyxl")
+
+    xlsx_path = csv_path.with_suffix(".xlsx")
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("ADS-B Data")
+
+    hdr_font  = Font(bold=True, color="F5F5F0", name="Courier New")
+    hdr_fill  = PatternFill("solid", fgColor="0D0D0D")
+    hdr_align = Alignment(horizontal="center")
+
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        for i, row in enumerate(csv.reader(f)):
+            cells = []
+            for val in row:
+                c = WriteOnlyCell(ws, value=val)
+                if i == 0:
+                    c.font      = hdr_font
+                    c.fill      = hdr_fill
+                    c.alignment = hdr_align
+                cells.append(c)
+            ws.append(cells)
+
+    wb.save(xlsx_path)
+    log.info(f"Excel exported  {xlsx_path.name}")
+    return xlsx_path
+
+
+C = {
+    "bg":          "#080C0F",
+    "surface":     "#0E1419",
+    "border":      "#1C2730",
+    "border_hi":   "#2A3D50",
+    "text":        "#D4D8DC",
+    "text_dim":    "#4A5668",
+    "text_accent": "#7EC8E3",
+    "green":       "#2EC27E",
+    "green_dim":   "#1A7A4A",
+    "red":         "#C0392B",
+    "amber":       "#E0A030",
+    "mono":        "Courier New",
+    "ui":          "Helvetica",
+}
+
+
+class ShipNameDialog(tk.Toplevel):
+    def __init__(self, parent, callback):
+        super().__init__(parent)
+        self.title("Ship Name")
+        self.configure(bg=C["bg"])
+        self.resizable(False, False)
+        self.grab_set()
+        self.callback = callback
+        self._build()
+        self.transient(parent)
+        self.geometry("480x290")
+
+    def _build(self):
+        tk.Frame(self, height=8, bg=C["bg"]).pack()
+        tk.Label(self, text="SHIP NAME", bg=C["bg"], fg=C["text_dim"],
+                 font=(C["mono"], 11, "bold")).pack(pady=(18, 4))
+        tk.Label(self, text="Enter Ship Name", bg=C["bg"], fg=C["text"],
+                 font=(C["ui"], 14)).pack(pady=(0, 18))
+        self._entry = tk.Entry(
+            self, font=(C["mono"], 15), width=26,
+            bg=C["surface"], fg=C["text"],
+            insertbackground=C["text_accent"],
+            relief="flat", bd=0,
+            highlightthickness=1,
+            highlightbackground=C["border_hi"],
+            highlightcolor=C["text_accent"],
+        )
+        self._entry.pack(ipady=8, padx=50)
+        self._entry.focus()
+        tk.Frame(self, height=20, bg=C["bg"]).pack()
+        tk.Button(
+            self, text="CONFIRM", command=self._confirm,
+            bg=C["green"], fg=C["bg"],
+            font=(C["mono"], 13, "bold"),
+            relief="flat", cursor="hand2",
+            activebackground=C["green_dim"],
+            activeforeground=C["text"],
+            padx=28, pady=9,
+        ).pack()
+        self.bind("<Return>", lambda _: self._confirm())
+
+    def _confirm(self):
+        name = self._entry.get().strip()
+        if not name:
+            self._entry.config(highlightbackground=C["red"])
+            return
+        self.callback(name)
+        self.destroy()
+
+
+class StatTile(tk.Frame):
+    def __init__(self, parent, label: str, **kw):
+        super().__init__(parent, bg=C["surface"],
+                         highlightthickness=1,
+                         highlightbackground=C["border"], **kw)
+        tk.Label(self, text=label.upper(), bg=C["surface"], fg=C["text_dim"],
+                 font=(C["mono"], 10, "bold")).pack(pady=(14, 0))
+        self._val = tk.Label(self, text="0", bg=C["surface"], fg=C["text"],
+                             font=(C["mono"], 28, "bold"))
+        self._val.pack(pady=(4, 14))
+
+    def set(self, value: str):
+        self._val.config(text=value)
+
+    def set_color(self, color: str):
+        self._val.config(fg=color)
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("ADS-B TCP LOGGER  //  MILITARY PREDICTION")
+        self.resizable(True, True)
+        self.configure(bg=C["bg"])
+
+        # ── Fullscreen state ──────────────────────────────────────────────────
+        self._fullscreen = False
+        self.bind("<F11>",  self._toggle_fullscreen)
+        self.bind("<Escape>", self._exit_fullscreen)
+
+        self._cfg          = load_config()
+        self._ship_name    = self._cfg.get("ship_name", "")
+        self._session      = None
+        self._listener     = None
+        self._writer       = None
+        self._stop_event   = None
+        self._data_queue   = None
+        self._rx_count     = 0
+        self._write_count  = 0
+        self._mil_count    = 0
+        self._running      = False
+        self._start_time   = None
+        self._blink        = True
+
+        self._predictor = MilitaryPredictor()
+
+        self._build_ui()
+
+        if not self._ship_name:
+            self.after(120, self._ask_ship_name)
+        else:
+            self._lbl_ship.config(text=self._ship_name.upper())
+            self._check_orphans()
+
+    # ── Fullscreen helpers ────────────────────────────────────────────────────
+    def _toggle_fullscreen(self, event=None):
+        self._fullscreen = not self._fullscreen
+        self.attributes("-fullscreen", self._fullscreen)
+        self._btn_fullscreen.config(
+            text="⤢ WINDOWED" if self._fullscreen else "⤡ FULLSCREEN"
+        )
+
+    def _exit_fullscreen(self, event=None):
+        if self._fullscreen:
+            self._fullscreen = False
+            self.attributes("-fullscreen", False)
+            self._btn_fullscreen.config(text="⤡ FULLSCREEN")
+
+    def _ask_ship_name(self):
+        def on_confirm(name):
+            self._ship_name = name
+            self._cfg["ship_name"] = name
+            save_config(self._cfg)
+            self._lbl_ship.config(text=name.upper())
+            self._check_orphans()
+        ShipNameDialog(self, on_confirm)
+
+    def _check_orphans(self):
+        for f in DATA_DIR.glob("*_RUNNING.csv"):
+            target = Path(str(f).replace("_RUNNING.csv", "_INCOMPLETE.csv"))
+            f.rename(target)
+            log.warning(f"Orphan renamed: {target.name}")
+
+    def _build_ui(self):
+        # ── Compact top bar: title + ship + connection + live indicator ─────────
+        top_bar = tk.Frame(self, bg=C["bg"])
+        top_bar.pack(fill="x", padx=16, pady=(8, 0))
+
+        tk.Label(top_bar, text="ADS-B LOGGER",
+                 bg=C["bg"], fg=C["text"],
+                 font=(C["mono"], 13, "bold")).pack(side="left")
+
+        # Live indicator
+        self._live_canvas = tk.Canvas(top_bar, width=10, height=10,
+                                      bg=C["bg"], highlightthickness=0)
+        self._live_canvas.pack(side="left", padx=(14, 3))
+        self._live_dot = self._live_canvas.create_oval(1, 1, 9, 9,
+                                                       fill=C["border"], outline="")
+        self._lbl_live = tk.Label(top_bar, text="IDLE",
+                                  bg=C["bg"], fg=C["text_dim"],
+                                  font=(C["mono"], 9, "bold"))
+        self._lbl_live.pack(side="left", padx=(0, 14))
+
+        # Connection fields inline
+        def small_field(parent, label_text, default, width):
+            tk.Label(parent, text=label_text, bg=C["bg"], fg=C["text_dim"],
+                     font=(C["mono"], 8, "bold")).pack(side="left", padx=(8, 2))
+            e = tk.Entry(parent, width=width, font=(C["mono"], 11),
+                         bg=C["surface"], fg=C["text"],
+                         insertbackground=C["text_accent"],
+                         relief="flat", bd=0,
+                         highlightthickness=1,
+                         highlightbackground=C["border"],
+                         highlightcolor=C["text_accent"])
+            e.insert(0, default)
+            e.pack(side="left", ipady=3)
+            return e
+
+        self._ent_host = small_field(top_bar, "HOST", "127.0.0.1", 14)
+        self._ent_port = small_field(top_bar, "PORT", "30003", 6)
+
+        # Ship name on the right
+        tk.Label(top_bar, text="SHIP:", bg=C["bg"], fg=C["text_dim"],
+                 font=(C["mono"], 8, "bold")).pack(side="right", padx=(0, 4))
+        self._lbl_ship = tk.Label(top_bar, text="—",
+                                   bg=C["bg"], fg=C["text_accent"],
+                                   font=(C["mono"], 11, "bold"))
+        self._lbl_ship.pack(side="right", padx=(0, 10))
+
+        tk.Frame(self, height=1, bg=C["border"]).pack(fill="x", pady=(6, 0))
+
+        # ── Compact control bar ───────────────────────────────────────────────
+        ctrl = tk.Frame(self, bg=C["bg"])
+        ctrl.pack(fill="x", padx=16, pady=5)
+
+        def btn(parent, text, cmd, bg, fg, state="normal"):
+            return tk.Button(parent, text=text, command=cmd,
+                             bg=bg, fg=fg,
+                             font=(C["mono"], 9, "bold"),
+                             relief="flat", cursor="hand2",
+                             activebackground=C["border_hi"],
+                             activeforeground=C["text"],
+                             padx=10, pady=4, state=state)
+
+        self._btn_start      = btn(ctrl, "▶ START",       self._start_session,    C["green"],     C["bg"])
+        self._btn_stop       = btn(ctrl, "■ STOP",        self._stop_session,     C["border"],    C["text_dim"], "disabled")
+        self._btn_fullscreen = btn(ctrl, "⤡ FS",          self._toggle_fullscreen, C["border_hi"], C["text_accent"])
+        self._btn_ship_name  = btn(ctrl, "✎ SHIP",        self._ask_ship_name,    C["border_hi"], C["text"])
+        self._btn_export     = btn(ctrl, "↓ EXCEL",       self._export_excel,     C["border"],    C["text_dim"], "disabled")
+
+        self._btn_start.pack(side="left", padx=(0, 4))
+        self._btn_stop.pack(side="left",  padx=(0, 4))
+        self._btn_fullscreen.pack(side="left", padx=(0, 4))
+
+        self._btn_export.pack(side="right")
+        self._btn_ship_name.pack(side="right", padx=(0, 4))
+
+        # ── Compact inline stat strip ─────────────────────────────────────────
+        tk.Frame(self, height=1, bg=C["border"]).pack(fill="x")
+
+        stat_bar = tk.Frame(self, bg=C["surface"])
+        stat_bar.pack(fill="x")
+
+        def stat_chip(parent, label):
+            f = tk.Frame(parent, bg=C["surface"])
+            f.pack(side="left", padx=20, pady=6)
+            tk.Label(f, text=label, bg=C["surface"], fg=C["text_dim"],
+                     font=(C["mono"], 8, "bold")).pack(side="left", padx=(0, 6))
+            v = tk.Label(f, text="0", bg=C["surface"], fg=C["text"],
+                         font=(C["mono"], 12, "bold"))
+            v.pack(side="left")
+            return v
+
+        self._tile_wr  = stat_chip(stat_bar, "WRITTEN")
+        self._tile_mil = stat_chip(stat_bar, "MILITARY")
+        self._tile_dur = stat_chip(stat_bar, "DURATION")
+
+        tk.Frame(self, height=1, bg=C["border"]).pack(fill="x")
+
+        contacts_hdr = tk.Frame(self, bg=C["bg"])
+        contacts_hdr.pack(fill="x", padx=16, pady=(6, 4))
+
+        tk.Label(contacts_hdr, text="MILITARY CONTACTS",
+                 bg=C["bg"], fg=C["text_dim"],
+                 font=(C["mono"], 10, "bold")).pack(side="left")
+
+        self._contacts_count_lbl = tk.Label(
+            contacts_hdr, text="0 contacts",
+            bg=C["bg"], fg=C["text_dim"],
+            font=(C["mono"], 11),
+        )
+        self._contacts_count_lbl.pack(side="right")
+
+        scroll_outer = tk.Frame(self, bg=C["border"], bd=0)
+        scroll_outer.pack(fill="both", expand=True, padx=16, pady=(0, 0))
+
+        self._contacts_canvas = tk.Canvas(
+            scroll_outer, bg=C["bg"],
+            highlightthickness=0, bd=0,
+        )
+        scrollbar = tk.Scrollbar(scroll_outer, orient="vertical",
+                                 command=self._contacts_canvas.yview)
+        self._contacts_canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        self._contacts_canvas.pack(side="left", fill="both", expand=True)
+
+        self._contacts_inner = tk.Frame(self._contacts_canvas, bg=C["bg"])
+        self._canvas_window  = self._contacts_canvas.create_window(
+            (0, 0), window=self._contacts_inner, anchor="nw"
+        )
+
+        def _on_canvas_resize(event):
+            self._contacts_canvas.itemconfig(self._canvas_window, width=event.width)
+        self._contacts_canvas.bind("<Configure>", _on_canvas_resize)
+
+        def _on_mousewheel(event):
+            self._contacts_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self._contacts_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        self._no_contacts_lbl = tk.Label(
+            self._contacts_inner,
+            text="No military contacts detected yet",
+            bg=C["bg"], fg=C["text_dim"],
+            font=(C["mono"], 12), pady=30,
+        )
+        self._no_contacts_lbl.pack()
+
+        tk.Frame(self, height=1, bg=C["border"]).pack(fill="x")
+        status_bar = tk.Frame(self, bg=C["bg"])
+        status_bar.pack(fill="x")
+        self._lbl_status = tk.Label(status_bar, text="  Ready",
+                                    bg=C["bg"], fg=C["text_dim"],
+                                    font=(C["mono"], 10), anchor="w")
+        self._lbl_status.pack(side="left", fill="x", expand=True, ipady=6, padx=6)
+
+        file_row = tk.Frame(self, bg=C["bg"])
+        file_row.pack(fill="x", padx=16, pady=(4, 8))
+        tk.Label(file_row, text="SAVED FILE", bg=C["bg"], fg=C["text_dim"],
+                 font=(C["mono"], 8, "bold")).pack(anchor="w")
+        self._lbl_file = tk.Label(file_row, text="—",
+                                  bg=C["bg"], fg=C["text_accent"],
+                                  font=(C["mono"], 9), anchor="w",
+                                  wraplength=1060)
+        self._lbl_file.pack(anchor="w")
+
+        self.geometry("1100x900")
+        self._contact_widgets: dict[str, MilContactRow] = {}
+        self._tick()
+
+    def _start_session(self):
+        host     = self._ent_host.get().strip()
+        port_str = self._ent_port.get().strip()
+
+        if not port_str.isdigit():
+            messagebox.showerror("Error", "Source port must be a number.")
+            return
+        if not self._ship_name:
+            messagebox.showerror("Error", "No ship name configured.")
+            return
+
+        port = int(port_str)
+
+        self._rx_count    = 0
+        self._write_count = 0
+        self._mil_count   = 0
+        self._stop_event  = threading.Event()
+        self._data_queue  = queue.Queue(maxsize=QUEUE_MAXSIZE)
+
+        for w in self._contacts_inner.winfo_children():
+            w.destroy()
+        self._contact_widgets.clear()
+        self._no_contacts_lbl = tk.Label(
+            self._contacts_inner,
+            text="No military contacts detected yet",
+            bg=C["bg"], fg=C["text_dim"],
+            font=(C["mono"], 12), pady=30,
+        )
+        self._no_contacts_lbl.pack()
+        self._contacts_count_lbl.config(text="0 contacts", fg=C["text_dim"])
+
+        self._predictor.clear_session()
+
+        self._session = Session(self._ship_name)
+        self._session.init_csv()
+
+        self._listener = TCPListener(
+            host, port, self._ship_name,
+            self._data_queue, self._stop_event, self._on_stats,
+            self._predictor, self._on_military_detected,
+        )
+        self._writer = BatchWriter(
+            self._data_queue, self._stop_event,
+            self._session.csv_path, self._on_stats,
+        )
+
+        self._listener.start()
+        self._writer.start()
+        self._start_time = datetime.now()
+        self._running    = True
+
+        self._btn_start.config(state="disabled",  bg=C["border"],  fg=C["text_dim"])
+        self._btn_stop.config(state="normal",      bg=C["red"],     fg=C["text"])
+        self._btn_export.config(state="disabled",  bg=C["border"],  fg=C["text_dim"])
+        self._btn_ship_name.config(state="disabled")
+        for e in (self._ent_host, self._ent_port):
+            e.config(state="disabled")
+
+        self._set_status(f"LIVE  {self._ship_name}  {host}:{port}")
+        self._lbl_live.config(text="LIVE", fg=C["green"])
+
+    def _stop_session(self):
+        if not self._running:
+            return
+        self._running = False
+        self._stop_event.set()
+        self._set_status("Flushing buffers...")
+        self.update()
+
+        if self._writer:
+            self._writer.join(timeout=12)
+
+        final = self._session.finalize()
+
+        self._set_status("Writing military tracks...")
+        self.update()
+        self._predictor.write_military_tracks(self._session.mil_csv_path)
+        self._predictor.update_training_dataset()
+        self._predictor.clear_session()
+
+        self._btn_start.config(state="normal",    bg=C["green"],     fg=C["bg"])
+        self._btn_stop.config(state="disabled",   bg=C["border"],    fg=C["text_dim"])
+        self._btn_export.config(state="normal",   bg=C["border_hi"], fg=C["text"])
+        self._btn_ship_name.config(state="normal")
+        for e in (self._ent_host, self._ent_port):
+            e.config(state="normal")
+
+        self._lbl_live.config(text="IDLE", fg=C["text_dim"])
+        self._live_canvas.itemconfig(self._live_dot, fill=C["border"])
+        self._set_status(f"Saved  {final.name}")
+        self._lbl_file.config(text=str(final.resolve()))
+
+    def _on_military_detected(self, row: dict):
+        self._mil_count += 1
+        self.after(0, lambda r=dict(row): self._add_contact_row(r))
+
+    def _add_contact_row(self, row: dict):
+        icao = row.get("icao", "").upper()
+        if not icao or icao in self._contact_widgets:
+            return
+
+        if self._no_contacts_lbl.winfo_ismapped():
+            self._no_contacts_lbl.pack_forget()
+
+        if self._contact_widgets:
+            tk.Frame(self._contacts_inner, height=1,
+                     bg=C["border"]).pack(fill="x")
+
+        def on_resize():
+            self._contacts_inner.update_idletasks()
+            self._contacts_canvas.configure(
+                scrollregion=self._contacts_canvas.bbox("all")
+            )
+
+        contact = MilContactRow(self._contacts_inner, self._predictor, row, on_resize)
+        contact.pack(fill="x", pady=(0, 0))
+        self._contact_widgets[icao] = contact
+
+        self._contacts_inner.update_idletasks()
+        self._contacts_canvas.configure(
+            scrollregion=self._contacts_canvas.bbox("all")
+        )
+        self._contacts_canvas.yview_moveto(1.0)
+
+        n = len(self._contact_widgets)
+        self._contacts_count_lbl.config(
+            text=f"{n} contact{'s' if n != 1 else ''}",
+            fg=C["amber"] if n > 0 else C["text_dim"],
+        )
+
+    def _export_excel(self):
+        if not self._session or not self._session.final_path:
+            messagebox.showwarning("Warning", "No completed session available.")
+            return
+        self._set_status("Exporting to Excel...")
+        self._btn_export.config(state="disabled")
+        self.update()
+        csv_path = self._session.final_path
+
+        def run():
+            try:
+                xlsx = export_to_excel(csv_path)
+                self.after(0, lambda: self._set_status(f"Exported  {xlsx.name}"))
+                self.after(0, lambda: self._btn_export.config(state="normal"))
+                self.after(0, lambda: messagebox.showinfo("Export Complete", str(xlsx.resolve())))
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror("Export Error", str(exc)))
+                self.after(0, lambda: self._set_status("Export failed"))
+                self.after(0, lambda: self._btn_export.config(state="normal"))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_stats(self, event: str, count: int = 1):
+        if event == "rx":
+            self._rx_count += count
+        elif event == "write":
+            self._write_count += count
+
+    def _tick(self):
+        self._tile_wr.config(text=f"{self._write_count:,}")
+        self._tile_mil.config(text=f"{self._mil_count:,}")
+        if self._mil_count > 0:
+            self._tile_mil.config(fg=C["amber"])
+
+        if self._running and self._start_time:
+            elapsed = datetime.now() - self._start_time
+            h, rem  = divmod(int(elapsed.total_seconds()), 3600)
+            m, s    = divmod(rem, 60)
+            self._tile_dur.config(text=f"{h:02d}:{m:02d}:{s:02d}")
+            self._blink = not self._blink
+            self._live_canvas.itemconfig(
+                self._live_dot,
+                fill=C["green"] if self._blink else C["bg"]
+            )
+
+        self.after(1000, self._tick)
+
+    def _set_status(self, msg: str):
+        self._lbl_status.config(text=f"  {msg}")
+
+    def on_close(self):
+        if self._running:
+            if messagebox.askyesno("Quit", "Session is active. Stop and save before quitting?"):
+                self._stop_session()
+            else:
+                return
+        if self._session and not self._session.final_path:
+            self._session.mark_incomplete()
+        self.destroy()
+
+
+if __name__ == "__main__":
+    app = App()
+    app.protocol("WM_DELETE_WINDOW", app.on_close)
+    app.mainloop()
